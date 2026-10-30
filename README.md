@@ -1117,27 +1117,7 @@ Add `direction=checkpoint-to-azure` or `direction=azure-to-checkpoint` to traffi
 
 # Tunnel trigger prototypes
 
-## Ingress drops
-
-```text
-Name: {#CONNECTION} {#INSTANCE}: Ingress packet drops detected
-Severity: Warning
-Expression:
-sum(/Azure vWAN WEU VPN Gateway/azure.vwan.vpn.ingress.drops[{#CONNECTION},{#INSTANCE},{#REMOTEIP}],15m)>0
-```
-
-## Egress drops
-
-```text
-Name: {#CONNECTION} {#INSTANCE}: Egress packet drops detected
-Severity: Warning
-Expression:
-sum(/Azure vWAN WEU VPN Gateway/azure.vwan.vpn.egress.drops[{#CONNECTION},{#INSTANCE},{#REMOTEIP}],15m)>0
-```
-
-Start at `>0` for observation. After one or two weeks, adjust to a practical threshold such as `>10` or `>100` over 15 minutes if isolated Azure/IPsec events create noise.
-
----
+Use the **new packet-drop delta items** documented under Operational notes for packet-drop alerting. Do not trigger on the raw Azure packet-drop counter.
 
 # Tunnel graph prototype
 
@@ -1524,7 +1504,103 @@ From Azure's perspective:
 
 ## Packet drops
 
-Packet-drop values are totals for a five-minute Azure Monitor bucket. Start with warning thresholds and establish a baseline before increasing severity.
+The raw Azure packet-drop metric may remain at a fixed non-zero value for many polling cycles. For example, `9260, 9260, 9260` creates a flat graph even when there are no new drops. Keep the raw value for diagnostics, but use a delta item for operational graphs and alerts.
+
+### New packet-drop delta item prototypes
+
+Create two additional dependent item prototypes under `Azure vWAN VPN tunnel discovery`. Each delta item depends on the corresponding discovered raw packet-drop item prototype.
+
+#### New ingress packet drops
+
+| Field | Value |
+|---|---|
+| Name | `{#CONNECTION} {#INSTANCE}: New ingress packet drops` |
+| Type | Dependent item |
+| Key | `azure.vwan.vpn.ingress.drops.delta[{#CONNECTION},{#INSTANCE},{#REMOTEIP}]` |
+| Master item | `{#CONNECTION} {#INSTANCE}: Ingress packet drops` |
+| Type of information | Numeric float |
+| Units | `packets` |
+| History | `30d` |
+| Trends | `365d` |
+
+Preprocessing steps, in this exact order:
+
+1. `Simple change`
+2. `JavaScript`
+
+```javascript
+var v = Number(value);
+
+if (isNaN(v)) {
+    throw "Invalid packet-drop delta";
+}
+
+if (v < 0) {
+    return 0;
+}
+
+return v;
+```
+
+The second step suppresses a false negative spike if Azure resets the raw counter.
+
+#### New egress packet drops
+
+| Field | Value |
+|---|---|
+| Name | `{#CONNECTION} {#INSTANCE}: New egress packet drops` |
+| Type | Dependent item |
+| Key | `azure.vwan.vpn.egress.drops.delta[{#CONNECTION},{#INSTANCE},{#REMOTEIP}]` |
+| Master item | `{#CONNECTION} {#INSTANCE}: Egress packet drops` |
+| Type of information | Numeric float |
+| Units | `packets` |
+| History | `30d` |
+| Trends | `365d` |
+
+Use the same preprocessing sequence:
+
+1. `Simple change`
+2. `JavaScript` with the reset-handling code above.
+
+Example:
+
+```text
+Raw Azure counter:  9260  9260  9278  9278
+Stored delta:          0     18     0
+```
+
+The first sample establishes the baseline and therefore has no delta.
+
+### Packet-drop graph prototype
+
+Do not graph the raw counters for health visualization. Create or update the graph prototype to use:
+
+- `{#CONNECTION} {#INSTANCE}: New ingress packet drops`
+- `{#CONNECTION} {#INSTANCE}: New egress packet drops`
+
+Suggested graph name:
+
+```text
+{#CONNECTION} {#INSTANCE}: New VPN packet drops
+```
+
+A healthy tunnel should normally stay at zero and show spikes only when the raw Azure counter increases. Keep the raw packet-drop items in Latest data for diagnostics.
+
+### Packet-drop triggers
+
+Triggers should use the delta items, not the raw counters. A raw value such as `9260` can remain unchanged indefinitely and must not generate a permanent alarm.
+
+Start with Warning severity and a baseline threshold such as more than `100` newly dropped packets in 15 minutes:
+
+```text
+sum(/Azure vWAN WEU VPN Gateway/azure.vwan.vpn.ingress.drops.delta[{#CONNECTION},{#INSTANCE},{#REMOTEIP}],15m)>100
+```
+
+```text
+sum(/Azure vWAN WEU VPN Gateway/azure.vwan.vpn.egress.drops.delta[{#CONNECTION},{#INSTANCE},{#REMOTEIP}],15m)>100
+```
+
+Tune this threshold after one or two weeks of baseline data. If isolated rekey or convergence events produce no meaningful user impact, increase the threshold rather than alerting on every single packet.
 
 ## BGP route direction
 
@@ -1599,3 +1675,145 @@ After at least three successful discovery cycles:
   https://www.zabbix.com/documentation/7.4/en/manual/discovery/low_level_discovery/item_prototypes
 - Check Point: Azure Virtual WAN interoperability, `sk176249`  
   https://support.checkpoint.com/results/sk/sk176249
+
+---
+
+# Why Zabbix tunnel bandwidth can differ from the Azure Portal gateway graph
+
+A difference between the Zabbix per-tunnel graph and the Azure Portal **S2S Gateway Average Bandwidth** graph is expected. The two views answer different questions.
+
+## What Zabbix stores
+
+The tunnel discovery uses the Azure Monitor metrics:
+
+```text
+TunnelIngressBytes
+TunnelEgressBytes
+```
+
+for every `ConnectionName + RemoteIP + Instance` five-minute bucket. Zabbix converts each directional five-minute byte total into an average bit rate:
+
+```text
+bps = bytes * 8 / 300
+```
+
+This gives separate values for:
+
+```text
+gw-hq-dk Instance0: Check Point -> Azure
+gw-hq-dk Instance0: Azure -> Check Point
+gw-hq-dk Instance1: Check Point -> Azure
+gw-hq-dk Instance1: Azure -> Check Point
+```
+
+The calculation was verified against Azure's native `TunnelAverageBandwidth` metric. The values match extremely closely, proving that the Zabbix conversion and per-instance graph are correct.
+
+## Verified example at 2026-10-30 06:41 UTC
+
+### Instance1
+
+Azure Monitor byte metrics returned approximately:
+
+```text
+TunnelIngressBytes -> 1.142091 Mbps
+TunnelEgressBytes  -> 401.023594 Mbps
+```
+
+Combined throughput for the tunnel instance:
+
+```text
+1.142091 + 401.023594 = 402.165685 Mbps
+```
+
+Azure native `TunnelAverageBandwidth` returned:
+
+```text
+402.165680 Mbps
+```
+
+The values are effectively identical apart from rounding.
+
+### Instance0
+
+Azure Monitor byte metrics returned approximately:
+
+```text
+TunnelIngressBytes -> 0.562524 Mbps
+TunnelEgressBytes  -> 141.722047 Mbps
+```
+
+Combined throughput:
+
+```text
+0.562524 + 141.722047 = 142.284571 Mbps
+```
+
+Azure native `TunnelAverageBandwidth` returned:
+
+```text
+142.284568 Mbps
+```
+
+Again, the values are effectively identical.
+
+## What the Azure Portal gateway graph displays
+
+For the same timestamp, Azure's gateway-level `AverageBandwidth` metric returned:
+
+```text
+272.225292 Mbps
+```
+
+This corresponds to the average of the two VPN Gateway instance tunnel bandwidth values:
+
+```text
+(402.165680 + 142.284568) / 2
+= 272.225124 Mbps
+```
+
+The very small difference from `272.225292 Mbps` is rounding/metric precision.
+
+Therefore, for this scale-unit-2 VPN Gateway:
+
+```text
+Azure Gateway AverageBandwidth
+approximately equals
+(Instance0 TunnelAverageBandwidth + Instance1 TunnelAverageBandwidth) / 2
+```
+
+It is **not** the maximum busy-instance throughput and it is **not** the sum of both instances.
+
+## Operational interpretation
+
+During the verified example:
+
+```text
+Instance0 total throughput: approximately 142 Mbps
+Instance1 total throughput: approximately 402 Mbps
+Actual combined traffic:    approximately 544 Mbps
+Azure gateway average:      approximately 272 Mbps
+```
+
+Therefore, seeing approximately `35 MB/s` / `272-280 Mbps` in the Azure Portal while Zabbix shows an individual tunnel instance near `400 Mbps` does not indicate an error.
+
+Zabbix intentionally keeps the more granular per-instance, per-direction view. This is more useful for operational troubleshooting because it shows:
+
+- which VPN Gateway instance is carrying the traffic;
+- traffic direction independently;
+- flow-distribution imbalance between Instance0 and Instance1;
+- whether one tunnel is idle while the other tunnel carries most traffic;
+- the actual throughput handled by a particular tunnel instance rather than only a gateway average.
+
+No configuration change is required. The existing Zabbix traffic calculation should remain in place.
+
+## Comparison summary
+
+| Measurement | Scope | Direction | Example at 06:41 UTC |
+|---|---|---|---:|
+| Zabbix Instance1 egress | `gw-hq-dk` / Instance1 | Azure -> Check Point | ~401.02 Mbps |
+| Zabbix Instance1 ingress | `gw-hq-dk` / Instance1 | Check Point -> Azure | ~1.14 Mbps |
+| Native TunnelAverageBandwidth Instance1 | `gw-hq-dk` / Instance1 | Combined | ~402.17 Mbps |
+| Native TunnelAverageBandwidth Instance0 | `gw-hq-dk` / Instance0 | Combined | ~142.28 Mbps |
+| Azure Portal Gateway AverageBandwidth | Whole VPN Gateway | Average across gateway instances | ~272.23 Mbps |
+
+When validating future discrepancies, compare the Zabbix sum of ingress plus egress for a specific tunnel instance with Azure `TunnelAverageBandwidth` for that same `ConnectionName`, `RemoteIP`, `Instance`, five-minute timestamp, and aggregation interval. Compare the Azure Portal `AverageBandwidth` only against the gateway-level average, not against one individual tunnel instance.
