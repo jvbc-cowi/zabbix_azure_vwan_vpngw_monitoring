@@ -1817,3 +1817,235 @@ No configuration change is required. The existing Zabbix traffic calculation sho
 | Azure Portal Gateway AverageBandwidth | Whole VPN Gateway | Average across gateway instances | ~272.23 Mbps |
 
 When validating future discrepancies, compare the Zabbix sum of ingress plus egress for a specific tunnel instance with Azure `TunnelAverageBandwidth` for that same `ConnectionName`, `RemoteIP`, `Instance`, five-minute timestamp, and aggregation interval. Compare the Azure Portal `AverageBandwidth` only against the gateway-level average, not against one individual tunnel instance.
+
+---
+
+# Instance-name normalization and duplicate LLD cleanup
+
+## Problem observed
+
+Azure Monitor does not always return the `Instance` dimension with consistent capitalization. Depending on the metric series, the same VPN Gateway instance can appear as values such as:
+
+```text
+Instance1
+instance1
+INSTANCE1
+```
+
+Zabbix LLD treats these strings as different identities. Without normalization, this can create duplicate discovered BGP items with keys such as:
+
+```text
+azure.vwan.s2s.bgp.status[gw-om-ru,169.254.224.2,Instance1]
+azure.vwan.s2s.bgp.status[gw-om-ru,169.254.224.2,instance1]
+```
+
+The lowercase variant can also fail the Azure local BGP-IP lookup because the VPN Gateway configuration normally indexes the local BGP addresses using `Instance0` and `Instance1`.
+
+## Required fix
+
+The master collector must normalize the Azure `Instance` dimension before it is used in:
+
+- tunnel keys;
+- raw BGP keys;
+- BGP discovery keys;
+- Azure local BGP-IP lookups;
+- final tunnel objects;
+- final BGP objects.
+
+Add and retain this function in the master JavaScript:
+
+```javascript
+function normalizeInstance(value) {
+    var match;
+
+    if (value === null ||
+            value === undefined ||
+            value === "") {
+        return null;
+    }
+
+    match = String(value).match(/^instance([0-9]+)$/i);
+
+    if (match) {
+        return "Instance" + match[1];
+    }
+
+    return String(value);
+}
+```
+
+Every Azure Monitor `Instance` extraction must use:
+
+```javascript
+instance = normalizeInstance(
+    dimensionValue(
+        series.metadatavalues,
+        "Instance"
+    )
+);
+```
+
+The VPN Gateway configuration mapping must also normalize `ipconfigurationId`:
+
+```javascript
+normalizedConfigInstance = normalizeInstance(
+    bgpConfig.ipconfigurationId
+);
+
+azureLocalBgpByInstance[
+    normalizedConfigInstance
+] = String(localAddresses[0]);
+```
+
+The helper key functions also normalize defensively:
+
+```javascript
+function tunnelKey(connection, instance, remoteIp) {
+    return connection +
+        "|" +
+        normalizeInstance(instance) +
+        "|" +
+        remoteIp;
+}
+
+function bgpKey(siteName, peerAddress, instance) {
+    return siteName +
+        "|" +
+        peerAddress +
+        "|" +
+        normalizeInstance(instance);
+}
+```
+
+With this change:
+
+```text
+Instance1
+instance1
+INSTANCE1
+```
+
+all become:
+
+```text
+Instance1
+```
+
+before the discovery identity is generated.
+
+## Validation after replacing the master script
+
+Use the Zabbix item **Test** function before saving and inspect:
+
+```text
+tunnels
+bgp_peers
+unmatched_bgp_peers
+```
+
+There should be no lowercase `instance0` or `instance1` objects. All discovered instances should use the canonical form:
+
+```text
+Instance0
+Instance1
+```
+
+For example, a site such as `gw-om-ru` should have only one object for each actual S2S BGP instance:
+
+```text
+gw-om-ru / 169.254.224.2 / Instance0
+gw-om-ru / 169.254.224.2 / Instance1
+```
+
+The `azure_local_bgp_ip` field should also be populated for both canonical instance names rather than becoming null because of a capitalization mismatch.
+
+## Cleaning up already discovered duplicates
+
+Fixing the master collector stops new case-variant identities from being generated, but previously discovered lowercase items can remain according to the low-level-discovery lost-resource retention policy.
+
+For a one-time cleanup on the correlated S2S BGP discovery rule:
+
+```text
+Azure vWAN S2S BGP peer discovery
+```
+
+Temporarily configure:
+
+```text
+Disable lost resources: Immediately
+Delete lost resources: Immediately
+```
+
+Save the corrected master collector, allow the Zabbix configuration cache to refresh, and execute:
+
+```text
+Azure vWAN VPN: Get all tunnel metrics
+```
+
+After the stale lowercase resources are removed, restore the normal production settings:
+
+```text
+Disable lost resources: After 1h
+Delete lost resources: After 30d
+```
+
+The longer production retention protects item history when Azure Monitor temporarily omits a metric series.
+
+## Do not manually delete discovered items to fix this problem
+
+Manual deletion does not correct the discovery identity. If the LLD input continues to contain both `Instance1` and `instance1`, Zabbix recreates both items on the next discovery cycle. Fix the normalization in the master collector first, then let LLD remove the obsolete identity.
+
+## Check for an obsolete BGP discovery rule
+
+During development, an earlier generic BGP discovery design may have existed under a name such as:
+
+```text
+Azure vWAN BGP peer discovery
+```
+
+The final production discovery rule is:
+
+```text
+Azure vWAN S2S BGP peer discovery
+```
+
+Only the final correlated S2S BGP discovery rule should remain enabled. If both the old generic rule and the final correlated rule exist with BGP item prototypes, disable the obsolete generic rule to avoid two independent discovery paths creating overlapping BGP monitoring objects.
+
+## Final expected discovery rules
+
+The production host should have these two relevant discovery rules:
+
+```text
+Azure vWAN VPN tunnel discovery
+Azure vWAN S2S BGP peer discovery
+```
+
+The tunnel rule discovers traffic and packet-drop monitoring by:
+
+```text
+ConnectionName + canonical Instance + RemoteIP
+```
+
+The correlated BGP rule discovers S2S routing health by:
+
+```text
+VPN site + BGP peer address + canonical Instance
+```
+
+---
+
+# Current master-script revision notes
+
+The current production master script includes the following safeguards introduced during implementation:
+
+1. Azure `Instance` labels are canonicalized through `normalizeInstance()`.
+2. Tunnel identities are deduplicated before LLD output.
+3. BGP identities are deduplicated before VPN-site correlation.
+4. Azure local BGP-IP mapping uses the same canonical instance name.
+5. BGP metric series are correlated with configured and connected VPN sites instead of exposing every gateway-level BGP series as an S2S peer.
+6. Unmatched BGP series remain available in `unmatched_bgp_peers` for diagnostics but are excluded from correlated S2S discovery.
+7. Packet-drop raw counters remain available for diagnostics, while delta items should be used for operational drop graphs and alerts.
+8. Directional traffic remains calculated independently for each tunnel instance from five-minute `TunnelIngressBytes` and `TunnelEgressBytes` buckets.
+9. The Zabbix directional calculation has been verified against Azure `TunnelAverageBandwidth` and should not be changed merely because the Azure Portal displays the gateway-level average across instances.
+
+When cloning the host for another Azure vWAN VPN Gateway, use this normalized master-script revision on every clone. Ideally, move the common items and LLD configuration into a Zabbix template so future script updates are maintained in one place.
